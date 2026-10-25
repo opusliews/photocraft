@@ -2707,6 +2707,7 @@ impl eframe::App for PhotocraftApp {
         if cfg!(any(target_os = "windows", target_os = "linux")) && self.session.prefs().enhanced_controls.zoom_with_trackpad_pinch {
             wheel_nav::fold_legacy_pinch(ctx, raw_input);
         }
+        wheel_nav::set_zoom_modifier(ctx, self.session.prefs().general.zoom_modifier == photocraft_engine::prefs::ZoomModifier::Ctrl);
         self.inject_synthetic(ctx, raw_input);
         // After the control channel's own events (`ui.type`) join the OS's, before any widget.
         widgets::cap_text_events(&mut raw_input.events);

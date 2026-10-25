@@ -5,6 +5,9 @@
 //!   ⇧/Shift + ⌥/Alt + wheel snaps to the next zoom ladder level instead.
 //! - Preferences › General › Zoom with Scroll Wheel swaps the two: the wheel zooms and
 //!   ⌥/Alt + wheel scrolls; ⇧/Shift + wheel snaps to the next zoom ladder level.
+//! - Preferences › General › Zoom Modifier set to Ctrl ([`set_zoom_modifier`]) moves the zoom to
+//!   ⌘/Ctrl + wheel everywhere ⌥/Alt is used above; ⌥/Alt + wheel then scrolls like the plain
+//!   wheel and only ⇧ + wheel scrolls sideways.
 //! - A trackpad pinch zooms around the pointer, unless Preferences › Enhanced Controls ›
 //!   Zoom with Trackpad Pinch is off (then a pinch does nothing, and Windows' Ctrl + wheel
 //!   fractions scroll sideways like the wheel, because the fold below is skipped).
@@ -171,6 +174,23 @@ pub fn fold_legacy_pinch(ctx: &Context, raw: &mut RawInput) {
     }
 }
 
+/// Follow Preferences › General › Zoom Modifier (every frame, before the frame's input is read):
+/// with `ctrl_zooms` ⌘/Ctrl + wheel zooms and ⌥/Alt + wheel scrolls, so ⌘/Ctrl no longer scrolls
+/// sideways.
+pub fn set_zoom_modifier(ctx: &Context, ctrl_zooms: bool) {
+    if ctx.data(|d| d.get_temp::<bool>(ctrl_zooms_id())).unwrap_or(false) == ctrl_zooms {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(ctrl_zooms_id(), ctrl_zooms));
+    ctx.options_mut(|o| {
+        o.input_options.horizontal_scroll_modifier = if ctrl_zooms { Modifiers::SHIFT } else { Modifiers::SHIFT | Modifiers::COMMAND };
+    });
+}
+
+fn ctrl_zooms_id() -> Id {
+    Id::unique("pc-wheel-ctrl-zooms")
+}
+
 fn alt_id() -> Id {
     Id::unique("pc-wheel-alt")
 }
@@ -212,10 +232,11 @@ pub fn read(ctx: &Context, zoom_with_wheel: bool, pinch_zooms: bool, owner: Id, 
 /// two-finger pinch doesn't zoom ([`pinch_factor`]).
 pub fn read_with(ctx: &Context, zoom_with_wheel: bool, pinch_zooms: bool, owner: Id, hovered: bool, smooth: bool, touch_gestures: bool) -> Option<Wheel> {
     let notch = ctx.options(|o| o.input_options.line_scroll_speed);
+    let ctrl_zooms = ctx.data(|d| d.get_temp::<bool>(ctrl_zooms_id())).unwrap_or(false);
 
     // --- Modifier tracking (always runs for all callers) ---
     let (scroll, zoom_delta, latest_alt, latest_shift, wheel, page) = ctx.input(|i| {
-        let wheel = wheel_events(i);
+        let wheel = wheel_events(i, ctrl_zooms);
         let latest_alt = wheel.last().map(|(_, _, m)| m.alt && !m.command && !m.ctrl);
         let latest_shift = wheel.last().map(|(_, _, m)| m.shift && !m.command && !m.ctrl);
         (i.smooth_scroll_delta, pinch_factor(i, touch_gestures), latest_alt, latest_shift, wheel, i.content_rect().height())
@@ -332,7 +353,8 @@ fn is_alt_key(key: Key) -> bool {
 /// tapped), while the Alt key's own press and release still arrive; the menu bar follows those
 /// too (`menu_keys`). Alt is down from its press until its release, starting from whether it
 /// was down before this frame's first Alt key event (egui's `keys_down` when there is none).
-fn wheel_events(i: &InputState) -> Vec<(MouseWheelUnit, Vec2, Modifiers)> {
+/// With `ctrl_zooms` (Zoom Modifier: Ctrl) ⌘/Ctrl stands in for ⌥/Alt and ⌥/Alt is dropped.
+fn wheel_events(i: &InputState, ctrl_zooms: bool) -> Vec<(MouseWheelUnit, Vec2, Modifiers)> {
     let first_alt_key = i.events.iter().find_map(|e| match e {
         // A repeat means the key was already down; a release means it was down until then.
         Event::Key { key, pressed, repeat, .. } if is_alt_key(*key) => Some(!*pressed || *repeat),
@@ -344,7 +366,11 @@ fn wheel_events(i: &InputState) -> Vec<(MouseWheelUnit, Vec2, Modifiers)> {
         match e {
             Event::Key { key, pressed, .. } if is_alt_key(*key) => alt_key = *pressed,
             Event::MouseWheel { unit, delta, modifiers, .. } => {
-                let modifiers = Modifiers { alt: modifiers.alt || alt_key, ..*modifiers };
+                let modifiers = if ctrl_zooms {
+                    Modifiers { alt: modifiers.ctrl || modifiers.command, ctrl: false, command: false, mac_cmd: false, ..*modifiers }
+                } else {
+                    Modifiers { alt: modifiers.alt || alt_key, ..*modifiers }
+                };
                 wheel.push((*unit, *delta, modifiers));
             }
             _ => {}
@@ -391,9 +417,15 @@ mod tests {
     /// Feed `events` through an egui context set up like the app's (`legacy`: the Windows pinch
     /// fold on) and add up what the wheel did to the view over the following second.
     fn gesture(frames: Vec<Vec<Event>>, zoom_with_wheel: bool, legacy: bool) -> (Vec2, f32, i32) {
+        gesture_with(frames, zoom_with_wheel, legacy, false)
+    }
+
+    /// [`gesture`] with Zoom Modifier set to Ctrl when `ctrl_zooms`.
+    fn gesture_with(frames: Vec<Vec<Event>>, zoom_with_wheel: bool, legacy: bool, ctrl_zooms: bool) -> (Vec2, f32, i32) {
         let owner = Id::unique("test-gesture");
         let ctx = Context::default();
         configure(&ctx);
+        set_zoom_modifier(&ctx, ctrl_zooms);
         let (mut pan, mut zoom, mut snaps) = (Vec2::ZERO, 1.0, 0i32);
         let mut frames = frames.into_iter();
         for n in 0..60 {
@@ -620,6 +652,28 @@ mod tests {
         assert!(pan == Vec2::ZERO && (zoom - 1.1).abs() < 1e-4, "{pan:?} {zoom}");
         let (pan, zoom, _) = gesture(vec![vec![wheel(notch, CTRL)]], true, false);
         assert!(near(pan, Vec2::new(40.0, 0.0)) && zoom == 1.0, "⌘/Ctrl + wheel still scrolls sideways: {pan:?} {zoom}");
+    }
+
+    #[test]
+    fn ctrl_zoom_modifier_swaps_ctrl_and_alt() {
+        let notch = Vec2::new(0.0, 1.0);
+        let one = |m: Modifiers, zoom_with_wheel: bool| gesture_with(vec![vec![wheel(notch, m)]], zoom_with_wheel, true, true);
+        for m in [CTRL, CMD] {
+            let (pan, zoom, _) = one(m, false);
+            assert!(pan == Vec2::ZERO && (zoom - 1.1).abs() < 1e-4, "{m:?} + wheel zooms 10%: {pan:?} {zoom}");
+        }
+        let (pan, zoom, _) = one(Modifiers::ALT, false);
+        assert!(near(pan, Vec2::new(0.0, 40.0)) && zoom == 1.0, "⌥ + wheel scrolls vertically: {pan:?} {zoom}");
+        let (pan, zoom, _) = one(Modifiers::SHIFT, false);
+        assert!(near(pan, Vec2::new(40.0, 0.0)) && zoom == 1.0, "⇧ + wheel still scrolls sideways: {pan:?} {zoom}");
+        let (_, _, snaps) = one(Modifiers { shift: true, ..CTRL }, false);
+        assert_eq!(snaps, 1, "⇧ + Ctrl + wheel snaps");
+        // Zoom with Scroll Wheel on: the wheel zooms and Ctrl + wheel scrolls.
+        let (pan, zoom, _) = one(CTRL, true);
+        assert!(near(pan, Vec2::new(0.0, 40.0)) && zoom == 1.0, "{pan:?} {zoom}");
+        // A Windows touchpad pinch (fractional Ctrl + wheel) still zooms.
+        let (pan, zoom, _) = gesture_with(vec![vec![wheel(Vec2::new(0.0, 0.25), CTRL)]], false, true, true);
+        assert!(pan == Vec2::ZERO && zoom > 1.0, "{pan:?} {zoom}");
     }
 
     #[test]
